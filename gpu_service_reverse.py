@@ -49,8 +49,9 @@ map_time_to_dataset = {
     "2026.04.22-01.34.29": "0417_test_tube_reversed",
     "2026.04.22-01.43.49": "0417_french_press_reversed",
 }
-# train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
-train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
+# map_time_to_dataset = {k.replace('-', '/'): v for k, v in map_time_to_dataset.items()}  # for ITX path compatibility
+train_project_dir = f"/mnt/dongxu-fs1/data-hdd/geyuan/code/dp23rss_fork/data/outputs/{log_time.replace('-', '/')}_train_diffusion_transformer_hybrid_pusht_images"
+# train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
 train_project_dir = train_project_dir.replace('-', '/')
 dataset_name = "pot_object"  # shovel; pot, pot_light; pepper
 dataset_name = map_time_to_dataset.get(log_time, dataset_name)
@@ -229,7 +230,7 @@ def model_step(step_request: StepRequestFromEvaluator):
     # step_data = step_request.decode_to_raw()
     video_buffer = mem_buffer.get_or_allocate("gt_video")
     step_data = step_request.decode_to_raw_buffer(out_video_buffer=video_buffer)
-    instruction_text = step_data["instruction"]
+    instruction_text = step_data["instruction"]  # TODO: will contain a "success"/"fail" flag
     stage_flag = step_data["stage_flag"]
     gt_video = step_data["gt_video"]  # (B,V*Ts,H,W,3) uint8, Ts can be larger than v1
     tcp_state = step_data["tcp_state"]  # (B,Ts,D+6) float32 or None, NOTE: includes force data

@@ -160,23 +160,13 @@ task:
     transform_color_jitter: true  # ori:false
     zero_force: true  # ori:false
     p_camera_drop: 0.2  # ori:0.0
-#    data_root: "/home/geyuan/datasets/reverse/tower_boby_A/"
-#    h5_path: "/home/geyuan/datasets/reverse/hdf5/tower_boby_A_240p.h5"
-
-#    data_root: "/home/geyuan/datasets/TCL/0209_tower_boby_hard/"
-#    h5_path: "/home/geyuan/datasets/TCL/hdf5/0209_tower_boby_hard_240p.h5"
-#    data_root: "/home/geyuan/datasets/reverse/0209_tower_boby_hard_reversed/"
-#    h5_path: "/home/geyuan/datasets/reverse/hdf5/0209_tower_boby_hard_reversed_240p.h5"
-
-#    data_root: "/home/geyuan/datasets/TCL/0209_tower_boby_easy/"
-#    h5_path: "/home/geyuan/datasets/TCL/hdf5/0209_tower_boby_easy_240p.h5"
-    data_root: "/home/geyuan/datasets/reverse/0209_tower_boby_easy_reversed/"
-    h5_path: "/home/geyuan/datasets/reverse/hdf5/0209_tower_boby_easy_reversed_240p.h5"
+    data_root: "/mnt/dongxu-fs1/data-hdd/geyuan/datasets/reverse/0209_tower_boby_easy_reversed/"
+    h5_path: "/mnt/dongxu-fs1/data-hdd/geyuan/datasets/reverse/hdf5/0209_tower_boby_easy_reversed_240p.h5"
     use_h5: true
     ## Used by `TCLMasterSlaveDataset`
     slave_data_roots: null
     slave_h5_paths: null
-  dataset_target:  # Target domain
+  dataset_target:  # Target domain (not used)
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     shape_meta: *shape_meta
     horizon: ${horizon}
@@ -208,8 +198,8 @@ task:
   - 96
   name: tcl_reverse
   shape_meta: ${shape_meta}
-task_name: pusht_image
-#pretrained_ckpt: "data/outputs/2026.03.18/21.22.07_train_diffusion_transformer_hybrid_pusht_image/checkpoints/latest.ckpt"
+task_name: tcl_reverse
+#pretrained_ckpt: "data/outputs/2025.06.30/00.35.04_train_diffusion_transformer_hybrid_pusht_images/checkpoints/epoch=2800-val_loss=0.012.ckpt"
 training:
   checkpoint_every: 50  # ori:50
   debug: false
@@ -221,7 +211,7 @@ training:
   max_val_steps: null
   num_epochs: 1500  # ori:3050
   resume: true
-  rollout_every: -1  # ori:50, -1 means never
+  rollout_every: -1  # ori:50, disabled for real robot task (no PushT env)
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0
