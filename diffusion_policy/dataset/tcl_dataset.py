@@ -1,5 +1,6 @@
 import os
 import copy
+import json
 import numpy as np
 import torch
 from torchvision.transforms import transforms
@@ -48,7 +49,9 @@ class TCLImageDataset(BaseImageDataset):
         print("[DEBUG] type of tcl_dataset:", type(self.tcl_dataset))
         self.data_meta = self.tcl_dataset.load_meta_from_json(os.path.join(data_root, "statistics.json"))
         self.all_rel_actions = self.tcl_dataset.extracted_data["rel_actions"]
-        self.all_force_torques = self.tcl_dataset.dsets["force_torque"]
+        if "force_torque" in self.load_keys:
+            self.tcl_dataset.load_npy_by_key("force_torque")
+        self.all_force_torques = self.tcl_dataset.extracted_data.get("force_torque", None)
         self.dataset_stats = self.data_meta["stats"]  # key: `rel_actions`, `robot_obs`, `force_torque`
         self.dataset_total_len = self.data_meta["total_len"]
         self.dataset_action_min = np.array(self.dataset_stats["rel_actions"]["min"])
@@ -313,3 +316,226 @@ if __name__ == "__main__":
 
         if idx >= 5:
             exit()
+
+
+# TODO: class MergeTCLImageDataset
+# params: data_root -> data_roots
+# params: h5_path -> h5_paths (should be consistent with data_roots)
+
+
+class MergeTCLImageDataset(BaseImageDataset):
+    """Wrap multiple RoboKit data roots into a single training dataset.
+
+    Each root is an independent RoboKit directory (containing per-frame ``*.npz``
+    files organised in task/episode sub-folders). The wrapper constructs one
+    :class:`TCLImageDataset` per root, concatenates their samples into a single
+    global index space, and serves them through a unified ``__getitem__``.
+
+    Action / force normalisation statistics are taken from ``stats_source``:
+      - ``"first"``  : use sub[0]'s statistics (this is the recommended setting
+        for incremental learning, matching the note in ``reverse_dp_force.yaml``
+        that "模型仍要从最原始的数据集中读取 stats 进行归一化").
+      - ``"merged"`` : recompute min/max/mean/std over the concatenation of all
+        sub-datasets' ``extracted/rel_actions.npy`` and ``force_torque``.
+      - a path string : load statistics from the specified ``statistics.json``.
+
+    ``h5_paths`` must be list-aligned with ``data_roots``; entries may be
+    ``None`` to force that specific root to fall back to npz loading.
+    """
+
+    def __init__(self,
+                 data_roots,                     # list[str]
+                 h5_paths=None,                  # list[str | None] | None
+                 horizon: int = 16,
+                 pad_before: int = 0,
+                 pad_after: int = 0,
+                 shape_meta: dict = None,
+                 norm_force_type: str = "quantile",
+                 seed: int = 42,
+                 val_ratio: float = 0.02,
+                 max_train_episodes: int = 90,
+                 transform_color_jitter: bool = True,
+                 use_h5: bool = True,
+                 stats_source: str = "first",
+                 ):
+        super().__init__()
+        assert len(data_roots) >= 1, "MergeTCLImageDataset needs at least one data root"
+        if h5_paths is None:
+            h5_paths = [None] * len(data_roots)
+        assert len(h5_paths) == len(data_roots), \
+            f"h5_paths ({len(h5_paths)}) must align with data_roots ({len(data_roots)})"
+
+        self.data_roots = list(data_roots)
+        self.h5_paths = list(h5_paths)
+        self.shape_meta = shape_meta
+        self.norm_force_type = norm_force_type
+        self.horizon = horizon
+        self.pad_before = pad_before
+        self.pad_after = pad_after
+        self.seed = seed
+        self.val_ratio = val_ratio
+        self.max_train_episodes = max_train_episodes
+        self.transform_color_jitter = transform_color_jitter
+        self.use_h5 = use_h5
+        self.stats_source = stats_source
+
+        # 1. Build each sub-dataset with its own stats (we will overwrite later).
+        self.subs = []
+        for data_root, h5_path in zip(self.data_roots, self.h5_paths):
+            sub_use_h5 = bool(use_h5 and (h5_path is not None))
+            sub = TCLImageDataset(
+                data_root=data_root,
+                h5_path=h5_path,
+                use_h5=sub_use_h5,
+                horizon=horizon,
+                pad_before=pad_before,
+                pad_after=pad_after,
+                shape_meta=shape_meta,
+                norm_force_type=norm_force_type,
+                seed=seed,
+                val_ratio=val_ratio,
+                max_train_episodes=max_train_episodes,
+                transform_color_jitter=transform_color_jitter,
+            )
+            self.subs.append(sub)
+
+        # 2. Resolve merged statistics.
+        self.dataset_stats, self.dataset_total_len = self._resolve_stats(stats_source)
+        self.dataset_action_min = np.array(self.dataset_stats["rel_actions"]["min"])
+        self.dataset_action_max = np.array(self.dataset_stats["rel_actions"]["max"])
+
+        # 3. Broadcast the unified stats to every sub (keeps their internal
+        #    normalisation path consistent, so delegating __getitem__ yields
+        #    actions in the same [-1, 1] space regardless of which sub served
+        #    the sample).
+        for sub in self.subs:
+            sub.dataset_stats = copy.deepcopy(self.dataset_stats)
+            sub.dataset_action_min = self.dataset_action_min
+            sub.dataset_action_max = self.dataset_action_max
+
+        # 4. Build the global index by concatenating sub-dataset ranges.
+        self.sub_lengths = [len(sub) for sub in self.subs]
+        self.cum_offsets = [0]
+        for L in self.sub_lengths:
+            self.cum_offsets.append(self.cum_offsets[-1] + L)
+        self.total_len = self.cum_offsets[-1]
+
+        # 5. Shared shape cache (matches TCLImageDataset for downstream code).
+        self.action_shape = shape_meta["action"]["shape"]
+        self.obs_image_shape = shape_meta["obs"]["image"]["shape"]
+
+        print(f"[MergeTCLImageDataset] {len(self.subs)} roots merged, "
+              f"per-root lengths={self.sub_lengths}, total={self.total_len}, "
+              f"stats_source={stats_source}")
+
+    # ---------------------------------------------------------------- stats
+    def _resolve_stats(self, stats_source: str):
+        if stats_source == "first":
+            meta = self.subs[0].data_meta
+            return copy.deepcopy(meta["stats"]), int(meta["total_len"])
+
+        if stats_source == "merged":
+            merged_stats = {}
+            total_len = 0
+            # rel_actions / force_torque live as concatenable arrays on each sub.
+            rel_actions_all = np.concatenate(
+                [sub.all_rel_actions for sub in self.subs], axis=0)
+            merged_stats["rel_actions"] = _compute_min_max_mean_std(rel_actions_all)
+            # force_torque may not exist on all subs, but current pipeline
+            # always loads it through TCLImageDataset.
+            ft_all = np.concatenate(
+                [np.asarray(sub.all_force_torques) for sub in self.subs], axis=0)
+            merged_stats["force_torque"] = _compute_min_max_mean_std(ft_all)
+            p01 = np.quantile(ft_all, q=0.01, axis=0)
+            p99 = np.quantile(ft_all, q=0.99, axis=0)
+            merged_stats["force_torque"]["p01"] = p01.tolist() \
+                if isinstance(p01, np.ndarray) else p01
+            merged_stats["force_torque"]["p99"] = p99.tolist() \
+                if isinstance(p99, np.ndarray) else p99
+            # robot_obs: reuse sub[0] stats (only used for optional norm)
+            if "robot_obs" in self.subs[0].dataset_stats:
+                merged_stats["robot_obs"] = copy.deepcopy(
+                    self.subs[0].dataset_stats["robot_obs"])
+            total_len = sum(int(sub.data_meta["total_len"]) for sub in self.subs)
+            return merged_stats, total_len
+
+        # Otherwise treat stats_source as a path to a statistics.json
+        if not os.path.isabs(stats_source):
+            stats_source = os.path.join(self.data_roots[0], stats_source)
+        with open(stats_source, "r") as fp:
+            blob = json.load(fp)
+        return copy.deepcopy(blob["stats"]), int(blob.get("total_len", 0))
+
+    # ------------------------------------------------------------- dispatch
+    def _locate(self, abs_idx: int):
+        """Map a global index to (sub_id, local_idx)."""
+        abs_idx = int(abs_idx) % self.total_len
+        # linear scan is fine, len(self.subs) is small (<=~4 in practice)
+        for sub_id, offset in enumerate(self.cum_offsets[:-1]):
+            if abs_idx < self.cum_offsets[sub_id + 1]:
+                return sub_id, abs_idx - offset
+        raise IndexError(abs_idx)
+
+    def __len__(self):
+        return self.total_len
+
+    def __getitem__(self, abs_idx):
+        sub_id, local_idx = self._locate(abs_idx)
+        return self.subs[sub_id][local_idx]
+
+    # -------------------------------------------------------- DP integration
+    def get_normalizer(self, **kwargs) -> LinearNormalizer:
+        # All sub-datasets share the identity normalizer path; reuse sub[0].
+        return self.subs[0].get_normalizer(**kwargs)
+
+    def get_validation_dataset(self):
+        return self.create_val_dataset(self)
+
+    @classmethod
+    def create_val_dataset(cls, instance: 'MergeTCLImageDataset'):
+        val_set = cls(
+            data_roots=instance.data_roots,
+            h5_paths=instance.h5_paths,
+            horizon=instance.horizon,
+            pad_before=instance.pad_before,
+            pad_after=instance.pad_after,
+            shape_meta=instance.shape_meta,
+            norm_force_type=instance.norm_force_type,
+            seed=instance.seed,
+            val_ratio=instance.val_ratio,
+            max_train_episodes=instance.max_train_episodes,
+            transform_color_jitter=instance.transform_color_jitter,
+            use_h5=instance.use_h5,
+            stats_source=instance.stats_source,
+        )
+        # Shrink each sub to a small slice for validation, same convention as
+        # TCLImageDataset.create_val_dataset.
+        for sub in val_set.subs:
+            sub.tcl_dataset.total_length = 64
+        val_set.sub_lengths = [len(sub) for sub in val_set.subs]
+        val_set.cum_offsets = [0]
+        for L in val_set.sub_lengths:
+            val_set.cum_offsets.append(val_set.cum_offsets[-1] + L)
+        val_set.total_len = val_set.cum_offsets[-1]
+        return val_set
+
+
+def _compute_min_max_mean_std(arr: np.ndarray) -> dict:
+    """Return min/max/mean/std along axis 0, compatible with statistics.json."""
+    arr = np.asarray(arr)
+    flat = arr.reshape(arr.shape[0], -1)
+    mn = flat.min(axis=0)
+    mx = flat.max(axis=0)
+    # Guard against constant columns (matches RoboKit behaviour).
+    eq = (mn == mx)
+    mx = mx.copy()
+    mx[eq] += 1e-6
+    mean = flat.mean(axis=0)
+    std = flat.std(axis=0)
+    std = np.maximum(std, 1e-8)
+    return {
+        "min": mn.tolist(),
+        "max": mx.tolist(),
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+    }

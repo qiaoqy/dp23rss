@@ -11,6 +11,7 @@ import numpy as np
 import pydantic
 from PIL import Image
 from fastapi import FastAPI
+from omegaconf import OmegaConf
 
 import json
 import torch
@@ -20,6 +21,8 @@ from diffusion_policy.dataset.tcl_dataset import TCLImageDataset, TCLDatasetHDF5
 # from robokit.service.service_connector import ServiceConnector
 from robokit.connects.protocols import StepRequestFromEvaluator, StepRequestFromPolicy
 
+OmegaConf.register_new_resolver("eval", eval, replace=True)
+
 
 """ How to use me?
 conda activate robodiff
@@ -28,7 +31,7 @@ export PYTHONPATH=~/code/dp23rss_fork
 CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service_reverse:gpu_app --port 6070
 """
 gpu_app = FastAPI()
-max_cache_action = 32
+max_cache_action = 32  # NOTE: how many steps will be really executed by the policy before receiving new observation. This is determined by the training data collection process, e.g. if the data collection script saves one image every 8 steps, then max_cache_action should be set to 8.
 
 log_time = "2026.03.18-22.40.53"
 w_idx = -1
@@ -38,8 +41,9 @@ map_time_to_dataset = {
     "2026.03.17-00.32.10": "0209_tower_boby_hard_reversed",
     "2026.03.18-22.40.53": "0209_tower_boby_easy_reversed",
 }
-train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
-train_project_dir = train_project_dir.replace('-', '/')
+map_time_to_dataset = {k.replace('-', '/'): v for k, v in map_time_to_dataset.items()}  # for ITX path compatibility
+train_project_dir = f"/mnt/dongxu-fs1/data-hdd/geyuan/code/dp23rss_fork/data/outputs/{log_time.replace('-', '/')}_train_diffusion_transformer_hybrid_pusht_images"
+# train_project_dir = train_project_dir.replace('-', '/')
 dataset_name = "pot_object"  # shovel; pot, pot_light; pepper
 dataset_name = map_time_to_dataset.get(log_time, dataset_name)
 
@@ -50,7 +54,7 @@ else:
     print(f"[Warning] Using {dataset_name} for log_time={log_time}.")
 
 # Load dataset statistics
-dataset_statistics_file = f"/home/geyuan/datasets/reverse/{dataset_dir}/statistics.json"
+dataset_statistics_file = f"/mnt/dongxu-fs1/data-hdd/geyuan/datasets/reverse/{dataset_dir}/statistics.json"
 train_project_statistics_file = os.path.join(train_project_dir, "statistics.json")
 if os.path.exists(dataset_statistics_file):
     with open(dataset_statistics_file, 'r') as json_file:
@@ -60,8 +64,8 @@ if os.path.exists(dataset_statistics_file):
         dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
         dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
 
-        data_root = f"/home/geyuan/datasets/reverse/{dataset_dir}"
-        h5_path = f"/home/geyuan/datasets/reverse/hdf5/{dataset_dir}_240p.h5"
+        data_root = f"/mnt/dongxu-fs1/data-hdd/geyuan/datasets/reverse/{dataset_dir}"
+        h5_path = f"/mnt/dongxu-fs1/data-hdd/geyuan/datasets/reverse/hdf5/{dataset_dir}_240p.h5"
         tcl_hdf5_dataset = TCLDatasetHDF5(
             data_root, h5_path,
             use_extracted=True,
@@ -86,7 +90,7 @@ if os.path.exists(dataset_statistics_file):
         print("[Info] Dumped updated statistics.json to train_project_dir.")
 
 # Load statistics from train project dir (to be compatible with ITX deployment)
-assert os.path.exists(train_project_statistics_file), "[gpu_service] statistics.json not found in train_project_dir."
+assert os.path.exists(train_project_statistics_file), f"[gpu_service] statistics.json not found in train_project_dir: {train_project_statistics_file}"
 with open(train_project_statistics_file, 'r') as json_file:
     statistics = json.load(json_file)
     dataset_stats = statistics["stats"]
@@ -103,7 +107,7 @@ def get_agent(device: str):
     # model = DebugModel(sleep_duration=100)
     ## Op2. Replay model, load action data and sleep
     # model = ReplayModel(sleep_duration=25,
-    #                     replay_root="/home/geyuan/datasets/reverse/collected_data")
+    #                     replay_root="/mnt/dongxu-fs1/data-hdd/geyuan/datasets/reverse/collected_data")
 
     import hydra
     from omegaconf import OmegaConf
@@ -136,7 +140,7 @@ def get_agent(device: str):
     # (Optional) 4. Use replay model for debugging
     # from robokit.debug_utils.debug_classes import ReplayModel
     # model = ReplayModel(sleep_duration=0,
-    #                     replay_root="/home/geyuan/datasets/reverse/tower_boby_A",
+    #                     replay_root="/mnt/dongxu-fs1/data-hdd/geyuan/datasets/reverse/tower_boby_A",
     #                     replay_idx=10,
     #                     cache_actions_cnt=16,
     #                     )
@@ -171,7 +175,7 @@ def model_step(step_request: StepRequestFromEvaluator):
 
     # [] Parse input observation
     step_data = step_request.decode_to_raw()
-    instruction_text = step_data["instruction"]
+    instruction_text = step_data["instruction"]  # TODO: will contain a "success"/"fail" flag
     stage_flag = step_data["stage_flag"]
     gt_video = step_data["gt_video"]  # (B,V*Ts,H,W,3) uint8, Ts can be larger than v1
     tcp_state = step_data["tcp_state"]  # (B,Ts,D+6) float32 or None, NOTE: includes force data
@@ -253,7 +257,9 @@ def model_step(step_request: StepRequestFromEvaluator):
     # if action_idx == 0:
     with torch.no_grad():  # always enter
         action = agent.predict_action(obs_dict)['action_pred']
-        action = action[0, :]  # remove batch_dim, (T,D)
+        action = action[0, :]  # remove batch_dim, (T,D)\
+        # TODO: save the obs-action pair as collected data.
+        # Based on a class named `OnlineDataCollector` which will save the data in a structure similar to the training dataset, and can be easily merged into the training dataset for future training.
 
     # 3.b Postprocess
     # print(action.shape, action.min(dim=0)[0], action.max(dim=0)[0])

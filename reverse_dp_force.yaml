@@ -52,8 +52,6 @@ optimizer:
   transformer_weight_decay: 0.001  # ori:0.001
 past_action_visible: false
 policy:
-  # ori: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
-  # hdfree: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicyHDFree
   _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
   use_da: false
   domain_adapt:
@@ -138,7 +136,7 @@ shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!
     gripper:  # gripper
       shape: *image_shape
       type: rgb
-    joint_state:
+    joint_state:  # will load `joint_state` from dataset
       shape: [6]
       type: low_dim
     force:  # will load `force_torque` from dataset
@@ -148,7 +146,9 @@ shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!
   action:
     shape: [7]
 task:
-  dataset:  # Source domain
+  dataset:  # Source domain, NOTE: define the training dataset
+  # NOTE: 对于增量式学习,即便加入了新的data_root/h5_path,模型仍要从最原始的数据集中读取stats进行归一化
+  # NOTE: 所以建议 data_roots/h5_paths 的第一项始终保持不变
     _target_: diffusion_policy.dataset.tcl_dataset.TCLImageDataset
     shape_meta: ${shape_meta}
     horizon: ${horizon}
@@ -157,20 +157,10 @@ task:
     pad_after: ${eval:'${n_action_steps}-1'}
     seed: 42
     val_ratio: 0.02
-#    data_root: "/home/geyuan/datasets/reverse/tower_boby_A/"
-#    h5_path: "/home/geyuan/datasets/reverse/hdf5/tower_boby_A_240p.h5"
-
-#    data_root: "/home/geyuan/datasets/TCL/0209_tower_boby_hard/"
-#    h5_path: "/home/geyuan/datasets/TCL/hdf5/0209_tower_boby_hard_240p.h5"
-#    data_root: "/home/geyuan/datasets/reverse/0209_tower_boby_hard_reversed/"
-#    h5_path: "/home/geyuan/datasets/reverse/hdf5/0209_tower_boby_hard_reversed_240p.h5"
-
-#    data_root: "/home/geyuan/datasets/TCL/0209_tower_boby_easy/"
-#    h5_path: "/home/geyuan/datasets/TCL/hdf5/0209_tower_boby_easy_240p.h5"
-    data_root: "/home/geyuan/datasets/reverse/0209_tower_boby_easy_reversed/"
-    h5_path: "/home/geyuan/datasets/reverse/hdf5/0209_tower_boby_easy_reversed_240p.h5"
+    data_root: "/mnt/dongxu-fs1/data-hdd/geyuan/datasets/reverse/0209_tower_boby_easy_reversed/"
+    h5_path: "/mnt/dongxu-fs1/data-hdd/geyuan/datasets/reverse/hdf5/0209_tower_boby_easy_reversed_240p.h5"
     use_h5: true
-  dataset_target:  # Target domain
+  dataset_target:  # Target domain (not used)
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     shape_meta: *shape_meta
     horizon: ${horizon}
@@ -196,18 +186,18 @@ task:
     test_start_seed: 4300000  # ori:100000, download:4300000, [Note]: Should be totally same with the loading ckpt!!!
     train_start_seed: 0
     domain_shift: size
-  image_shape:
+  image_shape:  # not used
   - 3
   - 96
   - 96
-  name: pusht_image
+  name: tcl_reverse
   shape_meta: ${shape_meta}
-task_name: pusht_image
+task_name: tcl_reverse
 #pretrained_ckpt: "data/outputs/2025.06.30/00.35.04_train_diffusion_transformer_hybrid_pusht_images/checkpoints/epoch=2800-val_loss=0.012.ckpt"
 training:
   checkpoint_every: 50  # ori:50
   debug: false
-  device: cuda:0
+  device: cuda:0  # is this compatiable with DDP?
   gradient_accumulate_every: 1
   lr_scheduler: cosine
   lr_warmup_steps: 1000
@@ -215,7 +205,7 @@ training:
   max_val_steps: null
   num_epochs: 1500  # ori:3050
   resume: true
-  rollout_every: 10000  # ori:50
+  rollout_every: -1  # ori:50, disabled for real robot task (no PushT env)
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0

@@ -199,7 +199,8 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         topk_manager = None
 
         if accelerator.is_main_process:
-            env_runner = hydra.utils.instantiate(cfg.task.env_runner, output_dir=self.output_dir)
+            if cfg.training.rollout_every != -1:
+                env_runner = hydra.utils.instantiate(cfg.task.env_runner, output_dir=self.output_dir)
 
             # To avoid time inconsistency between ckpt dir and wandb run name
             run_dir = pathlib.Path(self.output_dir)  # data/outputs/YYYY.MM.DD/HH.MM.SS_xxx
@@ -385,10 +386,12 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
 
                         metric_dict = {k.replace('/', '_'): v for k, v in step_log.items()}
                         monitor_key = cfg.checkpoint.topk.monitor_key
-                        assert monitor_key in metric_dict, f"skip topk ckpt: monitor_key `{monitor_key}` not in step_log."
-                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
-                        if topk_ckpt_path is not None:
-                            self.save_checkpoint(path=topk_ckpt_path)
+                        if monitor_key not in metric_dict:
+                            print(f"[WARN] skip topk ckpt: monitor_key `{monitor_key}` not in step_log.")
+                        else:
+                            topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                            if topk_ckpt_path is not None:
+                                self.save_checkpoint(path=topk_ckpt_path)
 
                 if accelerator.is_main_process:
                     policy.train()
