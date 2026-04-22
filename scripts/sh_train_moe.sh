@@ -3,7 +3,7 @@ tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
-CUDA_VISIBLE_DEVICES=6,7 EN_FREEZE_OBS_ENCODER=true bash scripts/sh_train_moe.sh
+CUDA_VISIBLE_DEVICES=2,3,4,5 EN_FREEZE_OBS_ENCODER=false bash scripts/sh_train_moe.sh
 "
 
 ### Merge MoE ###
@@ -12,15 +12,15 @@ CONFIG_NAME="pusht256_moe.yaml"
 
 domain_shift="goal"
 zarr_paths=(
-  "data/pusht/pusht_256.zarr"
+  "data/pusht/pusht_256_block.zarr"
   "data/pusht/pusht_256_goal.zarr"
   "data/pusht/pusht_256_light.zarr"
 )
 ffn_expand_factor=(2 4 6)
 teacher_ckpts=(
-  "data/outputs/2026.04.15/16.41.59_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
-  "data/outputs/2026.04.15/16.44.03_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
-  "data/outputs/2026.04.15/16.59.43_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
+#  "data/outputs/2026.04.15/17.39.01_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
+#  "data/outputs/2026.04.15/16.44.03_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
+#  "data/outputs/2026.04.15/16.59.43_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
 )
 
 zarr_paths_override="[$(IFS=,; echo "${zarr_paths[*]}")]"

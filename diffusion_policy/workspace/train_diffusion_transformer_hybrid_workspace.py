@@ -207,6 +207,15 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
             logging_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
             logging_cfg["name"] = f"{run_dir.parent.name}-{run_dir.name}"  #YYYY.MM.DD - HH.MM.SS_xxx
 
+            # Save dataset statistics if supported
+            if hasattr(dataset, "compute_statistics_and_save_json"):
+                stats = dataset.compute_statistics_and_save_json(os.path.join(run_dir, "statistics.json"))
+                from robokit.debug_utils.printer import beautiful_print
+                print(f"[DEBUG] statistics saved. Content is:")
+                beautiful_print(stats)
+
+            print(f"[DEBUG] out_dir is: {run_dir}")
+
             wandb_run = wandb.init(
                 dir=str(self.output_dir),
                 config=OmegaConf.to_container(cfg, resolve=True),
@@ -385,6 +394,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                             self.save_snapshot()
 
                         metric_dict = {k.replace('/', '_'): v for k, v in step_log.items()}
+                        # NOTE: why no val_loss? {'train_loss': 0.44689754078118626, 'global_step': 282, 'epoch': 0, 'lr': 5.66e-05, 'train_action_mse_error': 0.2813175352475294}
                         monitor_key = cfg.checkpoint.topk.monitor_key
                         if monitor_key not in metric_dict:
                             print(f"[WARN] skip topk ckpt: monitor_key `{monitor_key}` not in step_log.")

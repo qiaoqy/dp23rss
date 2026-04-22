@@ -3,7 +3,7 @@ import io
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Union
 import copy
 import shutil
 
@@ -28,22 +28,30 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service_reverse:gpu_app --port 6070
+CUDA_VISIBLE_DEVICES=5 uvicorn gpu_service_reverse:gpu_app --port 6071
 """
 gpu_app = FastAPI()
 max_cache_action = 32  # NOTE: how many steps will be really executed by the policy before receiving new observation. This is determined by the training data collection process, e.g. if the data collection script saves one image every 8 steps, then max_cache_action should be set to 8.
 
-log_time = "2026.03.18-22.40.53"
+log_time = "2026.04.22-01.43.49"
 w_idx = -1
 
 map_time_to_dataset = {
     "2026.03.13-22.23.23": "tower_boby_A",
     "2026.03.17-00.32.10": "0209_tower_boby_hard_reversed",
     "2026.03.18-22.40.53": "0209_tower_boby_easy_reversed",
+    "2026.04.19-21.57.24": "0417_put_mouse_reversed",
+    "2026.04.20-00.24.00": "0417_ethernet_reversed",
+    "2026.04.20-00.48.42": "0417_greenyellowred_reversed",
+    "2026.04.21-01.53.58": "0209_tower_boby_easy_reversed",
+    "2026.04.21-01.43.02": "0417_put_mouse_reversed",
+    "2026.04.22-02.35.32": "0209_tower_boby_easy_reversed",
+    "2026.04.22-01.34.29": "0417_test_tube_reversed",
+    "2026.04.22-01.43.49": "0417_french_press_reversed",
 }
-map_time_to_dataset = {k.replace('-', '/'): v for k, v in map_time_to_dataset.items()}  # for ITX path compatibility
-train_project_dir = f"/mnt/dongxu-fs1/data-hdd/geyuan/code/dp23rss_fork/data/outputs/{log_time.replace('-', '/')}_train_diffusion_transformer_hybrid_pusht_images"
-# train_project_dir = train_project_dir.replace('-', '/')
+# train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
+train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
+train_project_dir = train_project_dir.replace('-', '/')
 dataset_name = "pot_object"  # shovel; pot, pot_light; pepper
 dataset_name = map_time_to_dataset.get(log_time, dataset_name)
 
@@ -148,6 +156,44 @@ def get_agent(device: str):
     return model, hydra_config, weight_path
 
 
+
+class SharedMemoryPool:
+    """
+    专为 Evaluator 和 Policy 通信设计的显式内存池
+    """
+
+    def __init__(self):
+        self._buffers: Dict[str, np.ndarray] = {}
+        self._shapes: Dict[str, Tuple] = {}
+
+    def get_or_allocate(self, key_to_shape: Union[str, Dict[str, Tuple]],
+                        dtype=np.float32) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """
+        检查并返回 Buffer。如果 Shape 发生变化，会自动重新分配。
+        """
+        if isinstance(key_to_shape, str):
+            return self._buffers[key_to_shape]
+        assert isinstance(key_to_shape, dict), "key_to_shape must be str or dict."
+        for key, shape in key_to_shape.items():
+            # 如果 key 不存在，或者 shape 发生了改变，才重新分配内存
+            if key not in self._buffers or self._shapes.get(key) != shape:
+                self._buffers[key] = np.empty(shape, dtype=dtype)
+                self._shapes[key] = shape
+                print(f"[DEBUG] SharedMemoryPool: set key `{key}` to shape {shape}.")
+
+        return {k: self._buffers[k] for k in key_to_shape.keys()}
+
+    def clear(self):
+        """支持手动释放内存"""
+        self._buffers.clear()
+        self._shapes.clear()
+
+
+@lru_cache()
+def get_mem_pool():
+    return SharedMemoryPool()
+
+
 @gpu_app.get("/")
 def read_root():
     return {"message": "Hello, World!"}
@@ -168,20 +214,28 @@ def model_reset():
 @gpu_app.post("/step")
 def model_step(step_request: StepRequestFromEvaluator):
     agent, hydra_config, weight_path = get_agent("cuda")  # shape:[C,H,W]
+    mem_buffer = get_mem_pool()
     print("[gpu_service] Using cached ckpt from: None. Model type:", type(agent), weight_path)
 
     # 1. Decode observation from received request
-    image_shape = hydra_config.image_shape
+    image_shape_C_H_W = hydra_config.image_shape
+    max_cache_action = step_request.max_cache_action
+    num_camera_views = step_request.num_camera_views
+    mem_buffer.get_or_allocate({
+        "gt_video": (1, num_camera_views * max_cache_action,
+                     image_shape_C_H_W[1], image_shape_C_H_W[2], image_shape_C_H_W[0])}, dtype=np.uint8)
 
     # [] Parse input observation
-    step_data = step_request.decode_to_raw()
-    instruction_text = step_data["instruction"]  # TODO: will contain a "success"/"fail" flag
+    # step_data = step_request.decode_to_raw()
+    video_buffer = mem_buffer.get_or_allocate("gt_video")
+    step_data = step_request.decode_to_raw_buffer(out_video_buffer=video_buffer)
+    instruction_text = step_data["instruction"]
     stage_flag = step_data["stage_flag"]
     gt_video = step_data["gt_video"]  # (B,V*Ts,H,W,3) uint8, Ts can be larger than v1
     tcp_state = step_data["tcp_state"]  # (B,Ts,D+6) float32 or None, NOTE: includes force data
 
     B, Ts, D_plus6 = tcp_state.shape
-    gt_video = torch.from_numpy(gt_video).float() / 127.5 - 1.  # (B,V*Ts,H,W,3), in [-1,1]
+    gt_video = torch.from_numpy(gt_video).to("cuda").float() / 127.5 - 1.  # (B,V*Ts,H,W,3), in [-1,1]
     gt_view0_B_T_C_H_W = gt_video[:, :Ts].permute(0, 1, 4, 2, 3)  # (B,T,C,H,W)
     gt_view1_B_T_C_H_W = gt_video[:, Ts:].permute(0, 1, 4, 2, 3)  # (B,T,C,H,W)
 
@@ -194,6 +248,9 @@ def model_step(step_request: StepRequestFromEvaluator):
     force_B_T_D = TCLImageDataset.norm_state_or_force(
         force_B_T_D, norm_type="quantile", meta_data=dataset_stats['force_torque']
     )
+    zero_force = getattr(hydra_config.task.dataset, "zero_force", False)
+    if zero_force:
+        force_B_T_D = force_B_T_D * 0.
 
     # joint_state = torch.from_numpy(np.array(joint_state)).to("cuda").unsqueeze(0)  # (B,T,6)
     obs_dict = {
@@ -241,7 +298,7 @@ def model_step(step_request: StepRequestFromEvaluator):
         primary_img = gt_view0_B_T_C_H_W[:, -1, :, :, :].unsqueeze(1)  # (B,1,C,H,W)
         gripper_img = gt_view1_B_T_C_H_W[:, -1, :, :, :].unsqueeze(1)  # (B,1,C,H,W)
 
-        print("[DEBUG] primary_img shape:", primary_img.shape)
+        print(f"[DEBUG] max_cache_action={max_cache_action}, primary_img shape:", primary_img.shape)
 
         obs_dict["image"] = primary_img  # should be (B,T,C,H,W)
         if "gripper" in hydra_config.shape_meta["obs"]:

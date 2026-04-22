@@ -3,14 +3,22 @@ tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
-CUDA_VISIBLE_DEVICES=2,3 bash scripts/sh_train_robosuite.sh
+CUDA_VISIBLE_DEVICES=6,7 bash scripts/sh_train_robosuite.sh
 "
 
 ### Merge MoE ###
 CONFIG_DIR="configs/"
 CONFIG_NAME="robosuite_dp.yaml"
 
-DATASET_NAME="Stack"
+NORM_INPUT_OUTPUT=false
+DATASET_NAME="UnStack"
+#DATASET_NAME="Stack"
+
+#DATASET_NAME="NutDisAssemblyRound"
+#DATASET_NAME="NutAssemblyRound"
+
+#DATASET_NAME="TwoArmPegRemoval"
+#DATASET_NAME="TwoArmPegInHole"
 
 DEVICE="cuda"
 
@@ -20,6 +28,7 @@ set -e
 set -x
 
 wandb online
+#wandb offline
 
 ### DDP training with accelerate
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -56,4 +65,5 @@ accelerate launch \
   train.py --config-dir=${CONFIG_DIR} --config-name=${CONFIG_NAME} training.seed=42 \
   training.device=${DEVICE} \
   hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}' \
-  task.env_name=${DATASET_NAME}
+  task.env_name=${DATASET_NAME}  \
+  task.dataset.norm_input_output=${NORM_INPUT_OUTPUT:-true}

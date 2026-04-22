@@ -51,7 +51,7 @@ past_action_visible: false
 policy:
   _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
   ### MoE related configs
-  en_freeze_obs_encoder: true  # ori: false
+  en_freeze_obs_encoder: false  # ori: false
   load_parts_from_ckpt: "obs_encoder"  # ori: all
   ffn_expand_factor: [2, 4, 6]  # ori:4
 
@@ -150,7 +150,6 @@ shape_meta: &shape_meta  # [WARNING]: the order of shape_meta is very important!
 task:
   dataset:  # Source domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.MergedPushTImageDataset
-#    _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     shape_meta: ${shape_meta}
     horizon: 10
     max_train_episodes: 90
@@ -160,14 +159,11 @@ task:
     val_ratio: 0.01
     transform_color_jitter: true  # ori:false
     zarr_paths:
-      - data/pusht/pusht_256.zarr  # source domain
+#      - data/pusht/pusht_256.zarr  # source domain
 #      - data/pusht/pusht_256_texture.zarr  # shift: texture
-#      - data/pusht/pusht_256_light.zarr  # shift: light
-#      - data/pusht/pusht_256_goal.zarr  # shift: goal
-#      - data/pusht/pusht_256_block.zarr  # shift: block
-#    zarr_path: data/pusht/pusht_256.zarr  # source domain
-#    zarr_path: data/pusht/pusht_256_light.zarr  # shift: light
-#    zarr_path: data/pusht/pusht_256_goal.zarr  # shift: goal
+      - data/pusht/pusht_256_light.zarr  # shift: light
+      - data/pusht/pusht_256_goal.zarr  # shift: goal
+      - data/pusht/pusht_256_block.zarr  # shift: block
   dataset_target:  # Target domain
     _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     horizon: 10
@@ -199,7 +195,7 @@ task:
   shape_meta: ${shape_meta}
 task_name: pusht256
 #pretrained_ckpt: "data/outputs/2026.04.02/18.33.44_train_diffusion_transformer_hybrid_pusht256s/checkpoints/latest.ckpt"
-pretrained_ckpt: "data/outputs/2026.04.07/19.27.27_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
+#pretrained_ckpt: "data/outputs/2026.04.07/19.27.27_train_diffusion_transformer_hybrid_pusht256/checkpoints/latest.ckpt"
 training:
   checkpoint_every: ${training.rollout_every}  # ori:50
   debug: false

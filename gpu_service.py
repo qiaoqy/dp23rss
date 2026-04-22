@@ -3,7 +3,7 @@ import io
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional, Union
 import copy
 import shutil
 
@@ -19,18 +19,19 @@ from torchvision.transforms import transforms
 from diffusion_policy.dataset.tcl_dataset import TCLImageDataset, TCLDatasetHDF5
 # from robokit.service.service_connector import ServiceConnector
 from robokit.connects.protocols import StepRequestFromEvaluator, StepRequestFromPolicy
+from robokit.debug_utils.time_profiler import global_time_profiler as gtp
 
 
 """ How to use me?
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-CUDA_VISIBLE_DEVICES=0 uvicorn gpu_service:gpu_app --port 6070
+CUDA_VISIBLE_DEVICES=4 uvicorn gpu_service:gpu_app --port 6070
 """
 gpu_app = FastAPI()
 max_cache_action = 32
 
-log_time = "2026.03.18-21.22.07"
+log_time = "2026.04.21-22.58.02"
 w_idx = -1
 
 map_time_to_dataset = {
@@ -49,8 +50,16 @@ map_time_to_dataset = {
     "2026.02.10-00.06.53": "0209_tower_boby",
     "2026.03.16-21.09.19": "0209_tower_boby_hard",
     "2026.03.18-21.22.07": "0209_tower_boby_easy",
+    "2026.04.18-00.45.25": "0417_put_mouse",
+    "2026.04.18-00.47.33": "0417_ethernet",
+    "2026.04.18-00.48.06": "0417_greenyellowred",
+    "2026.04.21-01.55.22": "0209_tower_boby_easy",
+    "2026.04.21-01.31.36": "0417_put_mouse",
+    "2026.04.21-22.57.11": "0417_test_tube",
+    "2026.04.21-22.58.02": "0417_french_press",
 }
-train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
+# train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
+train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
 train_project_dir = train_project_dir.replace('-', '/')
 dataset_name = "pot_object"  # shovel; pot, pot_light; pepper
 dataset_name = map_time_to_dataset.get(log_time, dataset_name)
@@ -158,6 +167,43 @@ def get_agent(device: str):
     return model, hydra_config, weight_path
 
 
+class SharedMemoryPool:
+    """
+    专为 Evaluator 和 Policy 通信设计的显式内存池
+    """
+
+    def __init__(self):
+        self._buffers: Dict[str, np.ndarray] = {}
+        self._shapes: Dict[str, Tuple] = {}
+
+    def get_or_allocate(self, key_to_shape: Union[str, Dict[str, Tuple]],
+                        dtype=np.float32) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+        """
+        检查并返回 Buffer。如果 Shape 发生变化，会自动重新分配。
+        """
+        if isinstance(key_to_shape, str):
+            return self._buffers[key_to_shape]
+        assert isinstance(key_to_shape, dict), "key_to_shape must be str or dict."
+        for key, shape in key_to_shape.items():
+            # 如果 key 不存在，或者 shape 发生了改变，才重新分配内存
+            if key not in self._buffers or self._shapes.get(key) != shape:
+                self._buffers[key] = np.empty(shape, dtype=dtype)
+                self._shapes[key] = shape
+                print(f"[DEBUG] SharedMemoryPool: set key `{key}` to shape {shape}.")
+
+        return {k: self._buffers[k] for k in key_to_shape.keys()}
+
+    def clear(self):
+        """支持手动释放内存"""
+        self._buffers.clear()
+        self._shapes.clear()
+
+
+@lru_cache()
+def get_mem_pool():
+    return SharedMemoryPool()
+
+
 @gpu_app.get("/")
 def read_root():
     return {"message": "Hello, World!"}
@@ -178,32 +224,45 @@ def model_reset():
 @gpu_app.post("/step")
 def model_step(step_request: StepRequestFromEvaluator):
     agent, hydra_config, weight_path = get_agent("cuda")  # shape:[C,H,W]
+    mem_buffer = get_mem_pool()
     print("[gpu_service] Using cached ckpt from: None. Model type:", type(agent), weight_path)
 
     # 1. Decode observation from received request
-    image_shape = hydra_config.image_shape
+    image_shape_C_H_W = hydra_config.image_shape
+    max_cache_action = step_request.max_cache_action
+    num_camera_views = step_request.num_camera_views
+    mem_buffer.get_or_allocate({
+        "gt_video": (1, num_camera_views * max_cache_action,
+                     image_shape_C_H_W[1], image_shape_C_H_W[2], image_shape_C_H_W[0])}, dtype=np.uint8)
 
     # [] Parse input observation
-    step_data = step_request.decode_to_raw()
+    with gtp("decode", group="process_request"):
+        video_buffer = mem_buffer.get_or_allocate("gt_video")
+        step_data = step_request.decode_to_raw_buffer(out_video_buffer=video_buffer)
     instruction_text = step_data["instruction"]
     stage_flag = step_data["stage_flag"]
     gt_video = step_data["gt_video"]  # (B,V*Ts,H,W,3) uint8, Ts can be larger than v1
     tcp_state = step_data["tcp_state"]  # (B,Ts,D+6) float32 or None, NOTE: includes force data
 
-    B, Ts, D_plus6 = tcp_state.shape
-    gt_video = torch.from_numpy(gt_video).float() / 127.5 - 1.  # (B,V*Ts,H,W,3), in [-1,1]
-    gt_view0_B_T_C_H_W = gt_video[:, :Ts].permute(0, 1, 4, 2, 3)  # (B,T,C,H,W)
-    gt_view1_B_T_C_H_W = gt_video[:, Ts:].permute(0, 1, 4, 2, 3)  # (B,T,C,H,W)
+    with gtp("cpu_type_convert", group="process_request"):
+        B, Ts, D_plus6 = tcp_state.shape
+        gt_video = torch.from_numpy(gt_video).to("cuda").float() / 127.5 - 1.  # (B,V*Ts,H,W,3), in [-1,1]
+        gt_view0_B_T_C_H_W = gt_video[:, :Ts].permute(0, 1, 4, 2, 3)  # (B,T,C,H,W)
+        gt_view1_B_T_C_H_W = gt_video[:, Ts:].permute(0, 1, 4, 2, 3)  # (B,T,C,H,W)
 
-    # instruction_text = step_request.instruction
-    # joint_state = step_request.joint_state
-    force_B_T_D = tcp_state[:, :, -6:].astype(np.float32)  # (B,T,6)
-    tcp_pose_B_T_D = tcp_state[:, :, :6].astype(np.float32)  # (B,T,6)
+        # instruction_text = step_request.instruction
+        # joint_state = step_request.joint_state
+        force_B_T_D = tcp_state[:, :, -6:].astype(np.float32)  # (B,T,6)
+        tcp_pose_B_T_D = tcp_state[:, :, :6].astype(np.float32)  # (B,T,6)
 
-    # Norm input states
-    force_B_T_D = TCLImageDataset.norm_state_or_force(
-        force_B_T_D, norm_type="quantile", meta_data=dataset_stats['force_torque']
-    )
+    with gtp("cpu_norm_input", group="process_request"):
+        # Norm input states
+        force_B_T_D = TCLImageDataset.norm_state_or_force(
+            force_B_T_D, norm_type="quantile", meta_data=dataset_stats['force_torque']
+        )
+        zero_force = getattr(hydra_config.task.dataset, "zero_force", False)
+        if zero_force:
+            force_B_T_D = force_B_T_D * 0.
 
     # joint_state = torch.from_numpy(np.array(joint_state)).to("cuda").unsqueeze(0)  # (B,T,6)
     obs_dict = {
@@ -212,42 +271,6 @@ def model_step(step_request: StepRequestFromEvaluator):
     }
 
     if True or agent.infer_frame_idx % max_cache_action == 0:  # always enter
-        # primary_imgs = []
-        # for idx, primary_img in enumerate(step_request.primary_rgb):
-        #     primary_img = base64.b64decode(primary_img)
-        #     primary_img = Image.open(io.BytesIO(primary_img), formats=["JPEG"])
-        #     primary_img.save(f"tmp_primary_{idx}.jpg")
-        #
-        #     rgb_transform = transforms.Compose([
-        #         transforms.Resize(image_shape[1:]),
-        #         transforms.ToTensor(),
-        #     ])
-        #     primary_img = rgb_transform(primary_img)  # (C,H,W), in [0,1]
-        #     primary_img = primary_img * 2. - 1.  # in [-1,1]
-        #     primary_imgs.append(primary_img)
-
-        # gripper_imgs = []
-        # for idx, gripper_img in enumerate(step_request.gripper_rgb):
-        #     gripper_img = base64.b64decode(gripper_img)
-        #     gripper_img = Image.open(io.BytesIO(gripper_img), formats=["JPEG"])
-        #     gripper_img.save(f"tmp_gripper_{idx}.jpg")
-        #
-        #     rgb_transform = transforms.Compose([
-        #         transforms.Resize(image_shape[1:]),
-        #         transforms.ToTensor(),
-        #     ])
-        #     gripper_img = rgb_transform(gripper_img)  # (C,H,W), in [0,1]
-        #     gripper_img = gripper_img * 2. - 1.  # in [-1,1]
-        #     gripper_imgs.append(gripper_img)
-
-        # 2. Preprocess, e.g resize, normalize, to_tensor, to_device
-        # primary_img = torch.stack(primary_imgs, dim=0)  # (T,C,H,W)
-        # primary_img = primary_img.to("cuda").unsqueeze(0)  # (B,T,C,H,W)
-        # gripper_img = torch.stack(gripper_imgs, dim=0)
-        # gripper_img = gripper_img.to("cuda").unsqueeze(0)
-        primary_img = gt_view0_B_T_C_H_W.to("cuda")
-        gripper_img = gt_view1_B_T_C_H_W.to("cuda")
-
         primary_img = gt_view0_B_T_C_H_W[:, -1, :, :, :].unsqueeze(1)  # (B,1,C,H,W)
         gripper_img = gt_view1_B_T_C_H_W[:, -1, :, :, :].unsqueeze(1)  # (B,1,C,H,W)
 
@@ -265,43 +288,35 @@ def model_step(step_request: StepRequestFromEvaluator):
     # 3.a Model inference
     # action_idx = agent.infer_frame_idx % max_cache_action
     # if action_idx == 0:
-    with torch.no_grad():  # always enter
-        action = agent.predict_action(obs_dict)['action_pred']
-        action = action[0, :]  # remove batch_dim, (T,D)
+    with gtp("predict_action", group="model_infer"):
+        with torch.no_grad():  # always enter
+            action = agent.predict_action(obs_dict)['action_pred']
+            action = action[0, :]  # remove batch_dim, (T,D)
 
     # 3.b Postprocess
     # print(action.shape, action.min(dim=0)[0], action.max(dim=0)[0])
     action = (action * 0.5 + 0.5).cpu()  # in [0,1]
     action = action.clamp(0., 1.)
     action = action * (dataset_action_max - dataset_action_min) + dataset_action_min
-    # # print(action.shape, action.min(dim=0), action.max(dim=0))
-    # agent.cache_action = action
-    # else:
-    #     action = agent.cache_action
 
-    # 4. Return results
-    # frame_action = action[action_idx].numpy().tolist()
-    # if frame_action[6] > 0.5:
-    #     frame_action[6] = 1.
-    # else:
-    #     frame_action[6] = 0.
-    # print("[gpu_service] Action:", len(frame_action), frame_action, obs_dict.keys())
+    with gtp("binarize_action", group="model_infer"):
+        cache_action = action
+        for act_idx in range(cache_action.shape[0]):
+            if cache_action[act_idx, 6:] >= 0.5:
+                cache_action[act_idx, 6:] = 1
+            else:
+                cache_action[act_idx, 6:] = 0
 
-    # cache_action = copy.deepcopy(agent.cache_action[0])  # remove batch dim
-    # cache_action = (cache_action * 0.5 + 0.5).cpu()  # in [0,1]
-    # cache_action = cache_action * (data_max - data_min) + data_min
-    cache_action = action
-    for act_idx in range(cache_action.shape[0]):
-        if cache_action[act_idx, 6:] >= 0.5:
-            cache_action[act_idx, 6:] = 1
-        else:
-            cache_action[act_idx, 6:] = 0
-
+    gtp.step()
     agent.infer_frame_idx += 1
     # return {"action": cache_action.detach().numpy().tolist()}
     out_action = cache_action[None, :, :].numpy()  # (1,T,D)
-    print("[DEBUG] gpu_service output action shape:", out_action.shape)
-    request_to_evaluator = StepRequestFromPolicy.encode_from_raw(action=out_action)
+    print(f"[DEBUG] index={agent.infer_frame_idx}, gpu_service output action shape:", out_action.shape)
+    with gtp("encode", group="process_request"):
+        request_to_evaluator = StepRequestFromPolicy.encode_from_raw(action=out_action)
+
+    if agent.infer_frame_idx % 15 == 0:
+        gtp.report()
     return request_to_evaluator.model_dump(mode="json")
 
 

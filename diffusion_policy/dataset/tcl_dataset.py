@@ -1,8 +1,12 @@
 import os
 import copy
 import json
+import bisect
 import numpy as np
 import torch
+import torch.nn.functional as F
+from typing import List
+from torch.utils.data import ConcatDataset
 from torchvision.transforms import transforms
 
 from robokit.datasets.tcl_datasets import TCLDataset, TCLDatasetHDF5
@@ -10,6 +14,58 @@ from robokit.debug_utils.printer import print_batch
 
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer, EmptyNormalizer
+
+
+# source: https://github.com/facebookresearch/drqv2/blob/main/drqv2.py
+class RandomShiftsAug(torch.nn.Module):
+    def __init__(self, pad):
+        super().__init__()
+        self.pad = pad
+
+    def forward(self, x_B_C_H_W: torch.Tensor) -> torch.Tensor:
+        input_ndim = x_B_C_H_W.ndim
+        if input_ndim == 3:
+            x_B_C_H_W = x_B_C_H_W.unsqueeze(0)
+
+        x = x_B_C_H_W.float()
+        n, c, h, w = x.size()
+
+        # 1. 对图像进行填充
+        padding = tuple([self.pad] * 4)
+        x_padded = F.pad(x, padding, "replicate")
+
+        # 2. 创建一个标准化的坐标网格 ([-1, 1])
+        # 这个网格对应于原始图像尺寸 (h, w)
+        arange_h = torch.linspace(-1.0, 1.0, h, device=x.device, dtype=x.dtype)
+        arange_w = torch.linspace(-1.0, 1.0, w, device=x.device, dtype=x.dtype)
+
+        # 使用 meshgrid 创建一个 (h, w, 2) 的网格
+        grid_h, grid_w = torch.meshgrid(arange_h, arange_w, indexing='ij')
+        base_grid = torch.stack((grid_w, grid_h), dim=-1)  # (x, y) 坐标
+        base_grid = base_grid.unsqueeze(0).repeat(n, 1, 1, 1)  # 扩展到批次维度 (n, h, w, 2)
+
+        # 3. 生成单个随机位移，并将其应用于所有帧
+        # 在填充后的像素空间中生成随机整数位移
+        # 将 size 的第一个维度从 n 改为 1，以确保所有帧使用相同的位移
+        shift_xy = torch.randint(0, 2 * self.pad + 1, size=(1, 1, 1, 2), device=x.device, dtype=x.dtype)
+
+        # 4. 将像素位移转换为 [-1, 1] 坐标空间的位移
+        # 注意：h 和 w 的缩放因子不同
+        shift_w = shift_xy[..., 0] * 2.0 / (w + 2 * self.pad)
+        shift_h = shift_xy[..., 1] * 2.0 / (h + 2 * self.pad)
+        shift = torch.stack((shift_w, shift_h), dim=-1)
+
+        # 5. 将位移应用到基础网格上
+        # shift 的形状是 (1, 1, 1, 2)，会自动广播到 base_grid 的 (n, h, w, 2)
+        grid = base_grid + shift
+
+        # 6. 使用 grid_sample 进行采样
+        grid_B_C_H_W = F.grid_sample(x_padded, grid, padding_mode="zeros", align_corners=False)
+
+        if input_ndim == 3:
+            grid_B_C_H_W = grid_B_C_H_W[0]  # (B,C,H,W) -> (C,H,W)
+
+        return grid_B_C_H_W
 
 
 class TCLImageDataset(BaseImageDataset):
@@ -23,6 +79,8 @@ class TCLImageDataset(BaseImageDataset):
                  # Data format
                  shape_meta: dict,
                  norm_force_type: str = "quantile",
+                 zero_force: bool = False,
+                 p_camera_drop: float = 0.,
                  # Others
                  seed: int = 42,
                  val_ratio: float = 0.02,
@@ -31,12 +89,17 @@ class TCLImageDataset(BaseImageDataset):
                  # RoboKit Dataset
                  h5_path: str = None,
                  use_h5: bool = False,
+                 # Not used
+                 **kwargs
                  ):
         super().__init__()
         # RoboKit Dataset
         self.data_root = data_root
         self.shape_meta = shape_meta
         self.norm_force_type = norm_force_type
+        self.zero_force = zero_force
+        self.p_camera_drop = p_camera_drop
+
         self.load_keys = ["rel_actions", "primary_rgb", "gripper_rgb", "robot_obs", "language_text", "force_torque"]
         self.h5_path = h5_path
         self.use_h5 = use_h5
@@ -104,22 +167,28 @@ class TCLImageDataset(BaseImageDataset):
                 saturation=0.05,
                 hue=0.05))
         transform_list.append(transforms.ToTensor())
+        if transform_color_jitter:
+            random_shift = RandomShiftsAug(pad=4)
+            transform_list.append(random_shift)
         self.obs_image_transform = transforms.Compose(transform_list)  # Similar augmentation params with OCTO
 
         print(f"[diffusion_policy.dataset.TCLImageDataset] dataset loaded, "
-              f"action_min={self.dataset_action_min}, action_max={self.dataset_action_max}")
+              f"action_min={self.dataset_action_min}, action_max={self.dataset_action_max}, "
+              f"zero_force={self.zero_force}, p_camera_drop={self.p_camera_drop}.")
 
-    def get_validation_dataset(self):
+    def get_validation_dataset(self) -> 'TCLImageDataset':
         return self.create_val_dataset(self)
 
     @classmethod
-    def create_val_dataset(cls, instance: 'TCLImageDataset'):
+    def create_val_dataset(cls, instance: 'TCLImageDataset') -> 'TCLImageDataset':
         val_set = cls(
             data_root=instance.data_root,
             horizon=instance.horizon,
             pad_before=instance.pad_before,
             pad_after=instance.pad_after,
             shape_meta=instance.shape_meta,
+            norm_force_type=instance.norm_force_type,
+            zero_force=instance.zero_force,
             seed=instance.seed,
             val_ratio=instance.val_ratio,
             max_train_episodes=instance.max_train_episodes,
@@ -225,11 +294,22 @@ class TCLImageDataset(BaseImageDataset):
                     force_torque = self.norm_state_or_force(
                         force_torque, self.norm_force_type, self.dataset_stats["force_torque"])
                     force_torque = torch.from_numpy(force_torque).to(torch.float32)
+
+            # Randomly dropout camera views, robot_states
+            if torch.rand(1).item() < self.p_camera_drop:
+                primary_rgb = torch.zeros_like(primary_rgb)
+            if "gripper" in obs_keys and torch.rand(1).item() < self.p_camera_drop:
+                gripper_rgb = torch.zeros_like(gripper_rgb)
+            if torch.rand(1).item() < self.p_camera_drop:
+                tcp_pose = torch.zeros_like(tcp_pose)
+
             obs_data["image"].append(primary_rgb)
             obs_data["joint_state"].append(tcp_pose)
             if "gripper" in obs_keys:
                 obs_data["gripper"].append(gripper_rgb)
             if "force" in obs_keys:
+                if self.zero_force:
+                    force_torque = torch.zeros_like(force_torque)
                 obs_data["force"].append(force_torque)
         obs_data = {k: torch.stack(v) for k, v in obs_data.items()}
         # obs_data["image"] = torch.stack(obs_data["image"])  # should be (T,C,H,W)
@@ -283,6 +363,149 @@ class TCLImageDataset(BaseImageDataset):
             assert norm_type == "identity"
             out_data = in_data
         return out_data
+
+
+class TCLMasterSlaveDataset(BaseImageDataset):
+    def __init__(
+            self,
+            # Master dataset config
+            data_root: str,
+            # Slave dataset config (must align one-to-one)
+            slave_data_roots: List[str],
+            slave_h5_paths: List[str],
+            # Sequence config
+            horizon: int,
+            pad_before: int,
+            pad_after: int,
+            # Data format
+            shape_meta: dict,
+            norm_force_type: str = "quantile",
+            zero_force: bool = False,
+            p_camera_drop: float = 0.,
+            # Others
+            seed: int = 42,
+            val_ratio: float = 0.02,
+            max_train_episodes: int = 90,
+            transform_color_jitter: bool = True,
+            # H5 config for master
+            h5_path: str = None,
+            use_h5: bool = False,
+    ):
+        super().__init__()
+        slave_data_roots = slave_data_roots or []
+        slave_h5_paths = slave_h5_paths or []
+        if len(slave_data_roots) != len(slave_h5_paths):
+            raise ValueError(
+                f"slave_data_roots and slave_h5_paths must have the same length, "
+                f"got {len(slave_data_roots)} vs {len(slave_h5_paths)}."
+            )
+        if use_h5 and h5_path is None:
+            raise ValueError("`h5_path` for master dataset must be provided when use_h5=True.")
+        if use_h5 and any(p is None for p in slave_h5_paths):
+            raise ValueError("All `slave_h5_paths` must be provided when use_h5=True.")
+
+        self.master_dataset = TCLImageDataset(
+            data_root=data_root,
+            horizon=horizon,
+            pad_before=pad_before,
+            pad_after=pad_after,
+            shape_meta=shape_meta,
+            norm_force_type=norm_force_type,
+            zero_force=zero_force,
+            p_camera_drop=p_camera_drop,
+            seed=seed,
+            val_ratio=val_ratio,
+            max_train_episodes=max_train_episodes,
+            transform_color_jitter=transform_color_jitter,
+            h5_path=h5_path,
+            use_h5=use_h5,
+        )
+        self.slave_datasets: List[TCLImageDataset] = []
+        for slave_root, slave_h5_path in zip(slave_data_roots, slave_h5_paths):
+            slave_ds = TCLImageDataset(
+                data_root=slave_root,
+                horizon=horizon,
+                pad_before=pad_before,
+                pad_after=pad_after,
+                shape_meta=shape_meta,
+                norm_force_type=norm_force_type,
+                zero_force=zero_force,
+                p_camera_drop=p_camera_drop,
+                seed=seed,
+                val_ratio=val_ratio,
+                max_train_episodes=max_train_episodes,
+                transform_color_jitter=transform_color_jitter,
+                h5_path=slave_h5_path,
+                use_h5=use_h5,
+            )
+            self.slave_datasets.append(slave_ds)
+
+        self.datasets = [self.master_dataset] + self.slave_datasets
+        self.concat_dataset = ConcatDataset(self.datasets)
+        self._sync_master_stats_to_slaves()
+
+        # Keep compatibility with TCLImageDataset style attrs
+        self.data_root = data_root
+        self.h5_path = h5_path
+        self.use_h5 = use_h5
+        self.slave_data_roots = slave_data_roots
+        self.slave_h5_paths = slave_h5_paths
+
+        self.shape_meta = shape_meta
+        self.horizon = horizon
+        self.pad_before = pad_before
+        self.pad_after = pad_after
+        self.norm_force_type = norm_force_type
+        self.zero_force = zero_force
+        self.p_camera_drop = p_camera_drop
+        self.seed = seed
+        self.val_ratio = val_ratio
+        self.max_train_episodes = max_train_episodes
+        self.transform_color_jitter = transform_color_jitter
+
+        print(
+            f"[diffusion_policy.dataset.TCLMasterSlaveDataset] "
+            f"loaded with 1 master + {len(self.slave_datasets)} slaves, "
+            f"total_len={len(self.concat_dataset)}."
+        )
+
+    def _sync_master_stats_to_slaves(self):
+        self.dataset_stats = self.master_dataset.dataset_stats
+        self.dataset_total_len = self.master_dataset.dataset_total_len
+        self.dataset_action_min = self.master_dataset.dataset_action_min
+        self.dataset_action_max = self.master_dataset.dataset_action_max
+
+        for slave_ds in self.slave_datasets:
+            slave_ds.dataset_stats = self.dataset_stats
+            slave_ds.dataset_action_min = self.dataset_action_min
+            slave_ds.dataset_action_max = self.dataset_action_max
+
+    def get_validation_dataset(self):
+        val_set = copy.copy(self)
+        val_set.master_dataset = self.master_dataset.get_validation_dataset()
+        val_set.slave_datasets = [ds.get_validation_dataset() for ds in self.slave_datasets]
+        val_set.datasets = [val_set.master_dataset] + val_set.slave_datasets
+        val_set.concat_dataset = ConcatDataset(val_set.datasets)
+        val_set._sync_master_stats_to_slaves()
+        return val_set
+
+    def get_normalizer(self, **kwargs) -> LinearNormalizer:
+        return self.master_dataset.get_normalizer(**kwargs)
+
+    def __len__(self):
+        return len(self.concat_dataset)
+
+    def __getitem__(self, idx):
+        idx = idx % self.__len__()
+        ds_idx = bisect.bisect_right(self.concat_dataset.cumulative_sizes, idx)
+        start = 0 if ds_idx == 0 else self.concat_dataset.cumulative_sizes[ds_idx - 1]
+        local_idx = idx - start
+
+        item = self.datasets[ds_idx][local_idx]
+        item["dataset_idx"] = torch.tensor(ds_idx, dtype=torch.long)
+        item["local_idx"] = torch.tensor(local_idx, dtype=torch.long)
+        item["is_master"] = torch.tensor(ds_idx == 0, dtype=torch.bool)
+        return item
 
 
 if __name__ == "__main__":
