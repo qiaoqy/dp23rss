@@ -248,6 +248,7 @@ class OnlineDataCollector:
             label = _parse_yn(self._ep_last_text)
             if label is None:
                 label = "N" if aborted else default_label
+            ep_key = f"ep_{self._ep_id:03d}"
             info = {
                 "length": self._ep_frame_count,
                 "sparse_label": label,
@@ -255,7 +256,26 @@ class OnlineDataCollector:
                 "created_at": int(time.time()),
                 "task_tag": self.task_tag,
             }
-            self._index[f"ep_{self._ep_id:03d}"] = info
+            # Refresh from disk to pick up any manual edits the user made
+            # to other episodes' sparse_label (e.g. flipping Y -> N for a
+            # failed rollout). We MUST NOT clobber those by writing back the
+            # stale in-memory copy.
+            disk_index: dict = {}
+            if self._index_path.exists():
+                try:
+                    disk_index = json.loads(self._index_path.read_text())
+                except Exception:
+                    disk_index = {}
+            # Merge: disk wins for *other* episodes, in-memory wins for the
+            # one we just closed — except we still preserve a pre-existing
+            # sparse_label for the current ep if the user already edited it
+            # (e.g. they manually wrote Y/N before /reset triggered).
+            merged = dict(disk_index)
+            prev = disk_index.get(ep_key)
+            if prev is not None and "sparse_label" in prev:
+                info["sparse_label"] = prev["sparse_label"]
+            merged[ep_key] = info
+            self._index = merged
             self._index_path.write_text(json.dumps(self._index, indent=2))
             self._ep_id = None
             self._ep_dir = None
@@ -289,5 +309,20 @@ class OnlineDataCollector:
         if self._ep_dir is not None:
             self.on_episode_end(aborted=False, default_label=default_label)
         with self._lock:
+            # Re-read from disk so any user-edited sparse_label survives
+            # the final write-back (mirror of on_episode_end logic).
+            disk_index: dict = {}
+            if self._index_path.exists():
+                try:
+                    disk_index = json.loads(self._index_path.read_text())
+                except Exception:
+                    disk_index = {}
+            merged = dict(disk_index)
+            for k, v in self._index.items():
+                prev = disk_index.get(k)
+                if prev is not None and "sparse_label" in prev:
+                    v = {**v, "sparse_label": prev["sparse_label"]}
+                merged[k] = v
+            self._index = merged
             self._index_path.write_text(json.dumps(self._index, indent=2))
             return {"num_episodes": len(self._index), "root": str(self.save_root)}

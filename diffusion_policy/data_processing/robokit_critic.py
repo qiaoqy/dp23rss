@@ -1,13 +1,22 @@
 """Simple V(s) critic trained on A-task rollouts for advantage filtering.
 
-Design choices mirror exp41:
+Design choices mirror exp37/40/41 (rev2fwd-il reference):
 * Input: ``primary_rgb`` (cropped to ``crop`` px, optional color-jitter) plus
   ``robot_obs[:6]`` (TCP pose). No force, no language.
 * Backbone: ResNet-18 feature pool → 512-dim embedding, concatenated with a
   4-layer MLP over TCP pose → ``V(s)`` scalar.
-* Loss: MSE against Bellman returns from
-  ``rev2fwd_il.data.value_labeling.compute_bellman_returns`` (imported lazily;
-  re-implemented here so dp23rss does not need the other repo installed).
+* Loss: MSE against **Monte-Carlo returns** with per-step penalty ``r=-1`` and
+  terminal success bonus ``R=max_episode_length``, normalised to ``[-1, 0)``:
+
+      success episode: V_bar(t) = -(T - t) / (2R)            ∈ (-0.5, 0)
+      failure episode: V_bar(t) = -0.5 - (T - t) / (2R)      ∈ (-1, -0.5)
+
+  This is the formulation used by exp37/40/41
+  (`rev2fwd_il.data.value_labeling.compute_mc_returns`). Failure trajectories
+  carry **negative** values (not zero), so a downstream advantage threshold of
+  ``0`` has a stable cross-task meaning. ``compute_bellman_returns`` (legacy
+  exp≤-30 labelling, failure=0) is still exposed for backward compat but no
+  longer the default.
 * Training: 1000 steps, AdamW(lr=5e-4, wd=1e-4), dropout=0.15, crop=112, color
   jitter always on (matches exp40/41).
 
@@ -54,14 +63,42 @@ except ImportError:  # pragma: no cover — torch is always present in robodiff
 
 # --------------------------------------------------------- reward / returns
 
+def compute_mc_returns(lengths: list[int],
+                       successes: list[bool],
+                       max_episode_length: int) -> list[np.ndarray]:
+    """Normalised MC return labels (matches exp41's ``compute_mc_returns``).
+
+    Per-step reward ``r=-1`` plus terminal success bonus ``R=max_episode_length``;
+    undiscounted (``gamma=1``); normalised to ``[-1, 0)``:
+
+        success: V_bar(t) = -(T - t) / (2R)            ∈ (-0.5, 0)
+        failure: V_bar(t) = -0.5 - (T - t) / (2R)      ∈ (-1, -0.5)
+
+    The boundary ``-0.5`` separates success from failure regardless of
+    episode length, which is the core property exploited by the downstream
+    advantage filter.
+    """
+    out = []
+    R = float(max_episode_length)
+    for T, ok in zip(lengths, successes):
+        remaining = np.arange(T, 0, -1, dtype=np.float32)
+        if ok:
+            v = -remaining / (2.0 * R)
+        else:
+            v = -0.5 - remaining / (2.0 * R)
+        out.append(v)
+    return out
+
+
 def compute_bellman_returns(lengths: list[int],
                              successes: list[bool],
                              gamma: float = 0.995,
                              success_reward: float = 1.0) -> list[np.ndarray]:
-    """Episode-level Bellman return (re-implementation of ``value_labeling``).
+    """Legacy episode-level Bellman return (failure = 0).
 
-    Success episode: V(t) = gamma^(T - t) * success_reward.
-    Failure episode: V(t) = 0 for all t.
+    Kept for backward compatibility with checkpoints trained before the
+    exp41-alignment switch (commit 2026-04-24). Not used by default —
+    new training paths use :func:`compute_mc_returns`.
     """
     out = []
     for T, ok in zip(lengths, successes):
@@ -121,10 +158,16 @@ if _TORCH_OK:
             for ei, ep in enumerate(self.episodes):
                 for fi in range(ep["T"]):
                     self.flat.append((ei, fi))
-            self.values = compute_bellman_returns(
-                [e["T"] for e in self.episodes],
-                [e["success"] for e in self.episodes],
-            )
+            # --- exp41-aligned: MC returns with per-step penalty + terminal
+            # bonus, normalised to [-1, 0). ``R = max_episode_length`` is
+            # auto-detected here (longest episode); :meth:`RoboKitCritic.fit`
+            # may override it before consuming :attr:`values`.
+            lengths = [e["T"] for e in self.episodes]
+            successes = [e["success"] for e in self.episodes]
+            self.max_episode_length = int(max(lengths)) if lengths else 1
+            self.values = compute_mc_returns(
+                lengths, successes,
+                max_episode_length=self.max_episode_length)
             aug = [transforms.ToPILImage()]
             if color_jitter:
                 aug.append(transforms.ColorJitter(0.1, 0.1, 0.1, 0.05))
@@ -183,6 +226,11 @@ class CriticConfig:
     color_jitter: bool = True
     num_workers: int = 8
     device: str = "cuda"
+    # --- value-labeling (exp41 MC returns). ``max_episode_length=0`` means
+    # auto-detect from the training set (= longest episode). Persisted into
+    # the checkpoint so the filter can use the same normalisation.
+    max_episode_length: int = 0
+    # legacy (Bellman) labelling kept for compat but unused by default.
     gamma: float = 0.995
     success_reward: float = 1.0
 
@@ -216,6 +264,19 @@ class RoboKitCritic:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         ds = _CriticDataset(collect_dir, cfg.crop, cfg.color_jitter)
+        # MC return normalisation: respect user override; otherwise use the
+        # dataset auto-detected longest episode.
+        if cfg.max_episode_length and cfg.max_episode_length != ds.max_episode_length:
+            ds.max_episode_length = int(cfg.max_episode_length)
+            ds.values = compute_mc_returns(
+                [e["T"] for e in ds.episodes],
+                [e["success"] for e in ds.episodes],
+                max_episode_length=ds.max_episode_length,
+            )
+        cfg.max_episode_length = ds.max_episode_length
+        n_succ = sum(e["success"] for e in ds.episodes)
+        print(f"[RoboKitCritic] MC return normalisation R = {cfg.max_episode_length} "
+              f"({n_succ}/{len(ds.episodes)} success episodes)")
         loader = DataLoader(ds, batch_size=cfg.batch_size,
                             num_workers=cfg.num_workers,
                             shuffle=True, drop_last=True,

@@ -363,53 +363,148 @@ class RoboKitSpeedAdjuster:
 
 # -------------------------------------------------- 3. advantage filter
 
+def _remove_short_runs(mask: np.ndarray, target_value: bool,
+                        min_length: int) -> np.ndarray:
+    """Flip runs of ``target_value`` shorter than ``min_length``.
+
+    Mirrors exp41's
+    ``rev2fwd_il.data.advantage_estimation._remove_short_runs``:
+
+    * ``target_value=False, min_length=L`` — drop segments shorter than ``L``
+      get converted back to keep (they are too short to be meaningful drops).
+    * ``target_value=True,  min_length=L`` — keep segments shorter than ``L``
+      that are *sandwiched* between drop runs become drop too (they are too
+      short to train on after the surrounding drop has cut them out).
+    """
+    out = mask.copy()
+    T = len(out)
+    i = 0
+    while i < T:
+        if out[i] != target_value:
+            i += 1
+            continue
+        j = i
+        while j < T and out[j] == target_value:
+            j += 1
+        if j - i < min_length:
+            if target_value:
+                # only flip if truly sandwiched — never trim episode boundaries
+                if i > 0 and j < T:
+                    out[i:j] = not target_value
+            else:
+                out[i:j] = not target_value
+        i = j
+    return out
+
+
 class RoboKitAdvantageFilter:
-    """Critic-based filter: drop episodes whose per-step advantage is too low.
+    """Critic-based **frame-level** filter, ported from exp41.
 
-    The critic is expected to output a scalar V(s) per frame. We then compute
-    GAE-style advantages using the trajectory's V sequence (with sparse rewards
-    given by ``reward_fn`` or zeros by default) and drop an episode when its
-    smoothed minimum advantage falls below ``drop_threshold``.
+    Pipeline (per episode):
+      1. ``values = critic.predict_episode_values(files)``  (T,)
+      2. ``adv    = GAE(values, gamma, lam, rewards)``       (T,)
+      3. (optional) ``adv = clip(adv, value_truncate, None)`` if ``value_truncate``
+         is not ``None`` — by default *no clip* (matches exp41).
+      4. ``smooth = moving_average(adv, smooth_window)``     (centered, reflect-padded)
+      5. ``keep   = smooth >= drop_threshold``               — initial frame mask
+      6. drop runs <``min_drop_length`` revert to keep      (too-short rejections)
+      7. keep runs <``min_keep_length`` (sandwiched) revert to drop (unusable stubs)
+      8. split keep mask into contiguous runs ≥ ``min_segment_frames`` and write
+         each as its own ``ep_<name>_pXX/`` (action chunks never cross a drop).
 
-    This is the light-weight companion to :class:`RoboKitCritic`; the heavy
-    lifting of scoring is done by ``critic.predict_episode_values(files)``.
+    Defaults are exp37/40/41's reference values:
+    ``gamma=0.995, lam=0.95, terminal_bootstrap=True, drop_threshold=0.0,
+    smooth_window=51, min_drop_length=50, min_keep_length=50,
+    value_truncate=None, step_reward=0`` — these match
+    ``rev2fwd_il.data.advantage_estimation.{compute_gae_from_values,
+    compute_frame_filter_mask}`` exactly.
+
+    The per-step penalty is **already baked into the critic's value targets**
+    (see :func:`compute_mc_returns`), so the filter takes ``rewards=zeros`` and
+    a clean ``τ=0`` threshold has cross-task semantics ("smoothed advantage
+    crossing zero" = "value sequence has stopped progressing toward the goal").
+
+    Reward signal:
+      * ``rewards=None`` (default): zeros — penalty is in V via MC labelling.
+      * ``step_reward != 0``: every frame gets ``-|step_reward|`` (legacy path,
+        only useful when paired with the legacy Bellman labelling).
     """
 
     def __init__(self,
                  critic,  # RoboKitCritic (deferred import to avoid torch at import-time)
-                 gamma: float = 1.0,
-                 lam: float = 0.0,
-                 drop_threshold: float = -2e-3,
-                 value_truncate: float = -5e-3,
-                 smooth_window: int = 31):
+                 gamma: float = 0.995,
+                 lam: float = 0.95,
+                 drop_threshold: float = 0.0,
+                 drop_quantile: Optional[float] = None,
+                 value_truncate: Optional[float] = None,
+                 smooth_window: int = 51,
+                 min_drop_length: int = 50,
+                 min_keep_length: int = 50,
+                 min_segment_frames: int = 24,
+                 step_reward: float = 0.0,
+                 terminal_bootstrap: bool = True):
         self.critic = critic
         self.gamma = float(gamma)
         self.lam = float(lam)
         self.drop_threshold = float(drop_threshold)
-        self.value_truncate = float(value_truncate)
+        self.drop_quantile = (None if drop_quantile is None
+                               else float(drop_quantile))
+        self.value_truncate = (None if value_truncate is None
+                                else float(value_truncate))
         self.smooth_window = int(smooth_window)
+        self.min_drop_length = int(min_drop_length)
+        self.min_keep_length = int(min_keep_length)
+        self.min_segment_frames = int(min_segment_frames)
+        self.step_reward = float(step_reward)
+        self.terminal_bootstrap = bool(terminal_bootstrap)
 
+    # --------------------------------------------------------- math helpers
     def _smooth(self, x: np.ndarray) -> np.ndarray:
+        """Centered moving average with reflect padding (matches exp41)."""
         w = self.smooth_window
-        if w <= 1 or x.size < w:
-            return x
-        kernel = np.ones(w) / w
-        return np.convolve(x, kernel, mode="same")
+        T = x.shape[0]
+        if w <= 1 or T == 0:
+            return x.astype(np.float64, copy=True)
+        kernel = np.ones(w, dtype=np.float64) / w
+        pad = w // 2
+        padded = np.pad(x.astype(np.float64), (pad, pad), mode="reflect")
+        return np.convolve(padded, kernel, mode="valid")[:T]
 
     def _advantages(self, values: np.ndarray,
                      rewards: Optional[np.ndarray] = None) -> np.ndarray:
+        """GAE backward recursion, matching ``compute_gae_from_values``."""
         T = values.shape[0]
         if rewards is None:
-            rewards = np.zeros(T, dtype=np.float64)
+            if self.step_reward != 0.0:
+                rewards = np.full(T, -abs(self.step_reward), dtype=np.float64)
+            else:
+                rewards = np.zeros(T, dtype=np.float64)
         adv = np.zeros(T, dtype=np.float64)
         gae = 0.0
         for t in reversed(range(T)):
-            next_v = values[t + 1] if t + 1 < T else values[t]
+            if t == T - 1:
+                next_v = values[t] if self.terminal_bootstrap else 0.0
+            else:
+                next_v = values[t + 1]
             delta = rewards[t] + self.gamma * next_v - values[t]
             gae = delta + self.gamma * self.lam * gae
             adv[t] = gae
         return adv
 
+    def compute_keep_mask(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return (keep_mask[T], smoothed_adv[T]) for a single episode."""
+        adv = self._advantages(np.asarray(values, dtype=np.float64))
+        if self.value_truncate is not None:
+            adv = np.clip(adv, self.value_truncate, None)
+        smoothed = self._smooth(adv)
+        keep = smoothed >= self.drop_threshold
+        keep = _remove_short_runs(keep, target_value=False,
+                                   min_length=self.min_drop_length)
+        keep = _remove_short_runs(keep, target_value=True,
+                                   min_length=self.min_keep_length)
+        return keep, smoothed
+
+    # ------------------------------------------------------------- driver
     def process_dir(self,
                     src_dir: str | Path,
                     dst_dir: str | Path) -> FilterStats:
@@ -417,30 +512,92 @@ class RoboKitAdvantageFilter:
         dst.mkdir(parents=True, exist_ok=True)
         eps = _discover_episodes(src)
         stats = FilterStats(stage="advantage_filter", episodes_in=len(eps))
-        for name, files in tqdm(eps, desc="adv_filter"):
-            stats.frames_in += len(files)
-            values = self.critic.predict_episode_values(files)  # (T,)
-            adv = self._advantages(np.asarray(values))
-            adv_smooth = self._smooth(adv)
-            adv_smooth = np.clip(adv_smooth, self.value_truncate, None)
-            drop_episode = bool(adv_smooth.min() < self.drop_threshold)
-            if drop_episode:
+
+        # ---- Pass 1: predict V(s), compute *raw* (unsmoothed, unclipped)
+        # advantages for every frame; cache them so we never re-run the critic.
+        cached: list[tuple[str, list, np.ndarray]] = []  # (name, files, raw_adv)
+        all_adv: list[np.ndarray] = []
+        for name, files in tqdm(eps, desc="adv_predict"):
+            T = len(files)
+            stats.frames_in += T
+            values = np.asarray(self.critic.predict_episode_values(files),
+                                 dtype=np.float64)
+            adv = self._advantages(values)
+            cached.append((name, files, adv))
+            all_adv.append(adv)
+
+        # ---- Resolve threshold. If ``drop_quantile`` is set, take that
+        # quantile of the *smoothed* per-frame advantages across the whole
+        # dataset (matches the user-facing "保留 80% 的帧" intuition; smoothing
+        # before quantile makes the threshold consistent with the keep rule).
+        if self.drop_quantile is not None:
+            smoothed_all = []
+            for _, _, adv in cached:
+                a = adv.copy()
+                if self.value_truncate is not None:
+                    a = np.clip(a, self.value_truncate, None)
+                smoothed_all.append(self._smooth(a))
+            pool = np.concatenate(smoothed_all) if smoothed_all else np.array([0.0])
+            tau = float(np.quantile(pool, self.drop_quantile))
+            print(f"[RoboKitAdvantageFilter] drop_quantile={self.drop_quantile} "
+                  f"-> drop_threshold = {tau:+.6e} "
+                  f"(pool size = {pool.size}, mean={pool.mean():+.3e}, "
+                  f"std={pool.std():+.3e})")
+            self.drop_threshold = tau
+            stats.frames_out  # touch (just to keep linter happy)
+
+        # ---- Pass 2: smooth + mask + write segments using the resolved tau.
+        for name, files, adv in tqdm(cached, desc="adv_filter"):
+            T = len(files)
+            keep_mask, smoothed = self._mask_from_adv(adv)
+            n_keep = int(keep_mask.sum())
+
+            if n_keep == 0:
                 stats.per_episode.append({
-                    "name": name, "kept": 0, "total": len(files), "dropped": True,
-                    "adv_min": float(adv_smooth.min()),
-                    "adv_mean": float(adv_smooth.mean()),
+                    "name": name, "kept": 0, "total": T, "segments": 0,
+                    "dropped": True,
+                    "adv_min": float(smoothed.min()),
+                    "adv_mean": float(smoothed.mean()),
                 })
                 continue
-            # Otherwise keep the whole episode as-is.
-            keep_idx = np.arange(len(files))
-            _copy_keep(files, keep_idx, dst / name)
-            stats.frames_out += len(files)
-            stats.episodes_out += 1
+
+            segs = _copy_keep_segments(files, keep_mask, dst, name,
+                                        min_seg_frames=self.min_segment_frames)
+            if not segs:
+                stats.per_episode.append({
+                    "name": name, "kept": n_keep, "total": T, "segments": 0,
+                    "dropped": True,
+                    "adv_min": float(smoothed.min()),
+                    "adv_mean": float(smoothed.mean()),
+                })
+                continue
+            kept_total = sum(n for _, n in segs)
+            stats.frames_out += kept_total
+            stats.episodes_out += len(segs)
             stats.per_episode.append({
-                "name": name, "kept": len(files), "total": len(files),
-                "dropped": False,
-                "adv_min": float(adv_smooth.min()),
-                "adv_mean": float(adv_smooth.mean()),
+                "name": name, "kept": kept_total, "total": T,
+                "segments": len(segs), "subs": segs, "dropped": False,
+                "adv_min": float(smoothed.min()),
+                "adv_mean": float(smoothed.mean()),
             })
-        (dst / "filter_stats.json").write_text(stats.to_json())
+        # persist resolved threshold + quantile for reproducibility
+        stats_dict = json.loads(stats.to_json())
+        stats_dict["resolved_drop_threshold"] = float(self.drop_threshold)
+        stats_dict["drop_quantile"] = (None if self.drop_quantile is None
+                                        else float(self.drop_quantile))
+        (dst / "filter_stats.json").write_text(json.dumps(stats_dict, indent=2))
         return stats
+
+    # internal: shared smooth+mask path used by both compute_keep_mask and
+    # process_dir's pass 2.
+    def _mask_from_adv(self, adv: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        a = adv.copy()
+        if self.value_truncate is not None:
+            a = np.clip(a, self.value_truncate, None)
+        smoothed = self._smooth(a)
+        keep = smoothed >= self.drop_threshold
+        keep = _remove_short_runs(keep, target_value=False,
+                                   min_length=self.min_drop_length)
+        keep = _remove_short_runs(keep, target_value=True,
+                                   min_length=self.min_keep_length)
+        return keep, smoothed
