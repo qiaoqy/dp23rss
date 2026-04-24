@@ -4,7 +4,7 @@ tmp="
 conda activate robodiff
 cd ~/code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork:$PYTHONPATH
-CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/sh_train_reverse.sh
+CUDA_VISIBLE_DEVICES=4,5,6,7 bash scripts/sh_train_reverse.sh
 "
 
 CONFIG_DIR="./"
@@ -31,13 +31,13 @@ CONFIG_NAME="reverse_dp_force.yaml"
 #DATA_ROOT="/home/geyuan/datasets/reverse/0417_greenyellowred_reversed/"
 #H5_PATH="/home/geyuan/datasets/reverse/hdf5/0417_greenyellowred_reversed_240p.h5"
 
-#DATA_ROOT="/home/geyuan/datasets/TCL/0417_test_tube/"
-#H5_PATH="/home/geyuan/datasets/TCL/hdf5/0417_test_tube_240p.h5"
+DATA_ROOT="/home/geyuan/datasets/TCL/0417_test_tube/"
+H5_PATH="/home/geyuan/datasets/TCL/hdf5/0417_test_tube_240p.h5"
 #DATA_ROOT="/home/geyuan/datasets/reverse/0417_test_tube_reversed/"
 #H5_PATH="/home/geyuan/datasets/reverse/hdf5/0417_test_tube_reversed_240p.h5"
 
-DATA_ROOT="/home/geyuan/datasets/TCL/0417_french_press/"
-H5_PATH="/home/geyuan/datasets/TCL/hdf5/0417_french_press_240p.h5"
+#DATA_ROOT="/home/geyuan/datasets/TCL/0417_french_press/"
+#H5_PATH="/home/geyuan/datasets/TCL/hdf5/0417_french_press_240p.h5"
 #DATA_ROOT="/home/geyuan/datasets/reverse/0417_french_press_reversed/"
 #H5_PATH="/home/geyuan/datasets/reverse/hdf5/0417_french_press_reversed_240p.h5"
 

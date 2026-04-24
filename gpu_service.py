@@ -57,6 +57,8 @@ map_time_to_dataset = {
     "2026.04.21-01.31.36": "0417_put_mouse",
     "2026.04.21-22.57.11": "0417_test_tube",
     "2026.04.21-22.58.02": "0417_french_press",
+    "2026.04.22-18.27.22": "0417_test_tube",
+    "2026.04.22-18.15.26": "0417_french_press",
 }
 # train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
 train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
@@ -124,6 +126,7 @@ with open(train_project_statistics_file, 'r') as json_file:
     datasets_total_len = statistics["total_len"]
     dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
     dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
+    dataset_action_mean = np.array(dataset_stats["rel_actions"]["mean"])
     dataset_stats['force_torque']['p01'] = np.array(dataset_stats["force_torque"]['p01'])
     dataset_stats['force_torque']['p99'] = np.array(dataset_stats["force_torque"]['p99'])
 
@@ -301,8 +304,10 @@ def model_step(step_request: StepRequestFromEvaluator):
 
     with gtp("binarize_action", group="model_infer"):
         cache_action = action
+        threshold = dataset_action_mean[-1]
+        print("[DEBUG] threshold=", threshold)
         for act_idx in range(cache_action.shape[0]):
-            if cache_action[act_idx, 6:] >= 0.5:
+            if cache_action[act_idx, 6:] >= threshold:
                 cache_action[act_idx, 6:] = 1
             else:
                 cache_action[act_idx, 6:] = 0

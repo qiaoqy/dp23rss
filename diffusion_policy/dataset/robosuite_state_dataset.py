@@ -1,5 +1,7 @@
 from typing import Dict, List, Optional, Sequence, Tuple
 import copy
+import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -84,6 +86,7 @@ class RobosuiteStateDataset(BaseImageDataset):
             max_train_episodes: Optional[int] = None,
             return_meta: bool = True,
             strict_success_episode: bool = True,
+            norm_input_output: bool = True,
             _shared: Optional[Dict] = None,
             _split: str = "train",
             _episode_mask: Optional[np.ndarray] = None,
@@ -100,6 +103,7 @@ class RobosuiteStateDataset(BaseImageDataset):
         self.max_train_episodes = max_train_episodes
         self.return_meta = bool(return_meta)
         self.strict_success_episode = bool(strict_success_episode)
+        self.norm_input_output = norm_input_output
         self.obs_keys = ("all_state", "agent_state", "env_state")
         self._split = _split
 
@@ -166,7 +170,7 @@ class RobosuiteStateDataset(BaseImageDataset):
                 trimmed.append((start, end))
                 continue
             first_success = int(success_steps[0])
-            trimmed.append((start, start + first_success + 1))
+            trimmed.append((start, start + first_success + 100))  # NOTE: append how many?
 
         if self.strict_success_episode and len(missing_success) > 0:
             raise ValueError(
@@ -279,6 +283,51 @@ class RobosuiteStateDataset(BaseImageDataset):
         normalizer["action"] = EmptyNormalizer.create_identity()
         return normalizer
 
+    def compute_statistics(self) -> Dict:
+        """
+        计算整个数据集（共享底层 transitions）的统计信息。
+        每个字段返回:
+            {
+                "min":  按维度最小值(list),
+                "max":  按维度最大值(list),
+                "mean": 按维度均值(list),
+                "std":  按维度标准差(list),
+                "count": 样本步数(int)
+            }
+        """
+        arrays = {
+            "all_state": self._shared["states"],
+            "agent_state": self._shared["agent_states"],
+            "env_state": self._shared["env_states"],
+            "action": self._shared["actions"],
+        }
+
+        stats = {
+            "num_episodes": int(len(self._shared["episodes"])),
+            "num_steps": int(self._shared["states"].shape[0]),
+            "stats": {},
+        }
+
+        for key, value in arrays.items():
+            value = np.asarray(value, dtype=np.float64)
+            stats["stats"][key] = {
+                "min": value.min(axis=0).tolist(),
+                "max": value.max(axis=0).tolist(),
+                "mean": value.mean(axis=0).tolist(),
+                "std": value.std(axis=0).tolist(),
+                "count": int(value.shape[0]),
+            }
+
+        return stats
+
+    def compute_statistics_and_save_json(self, json_path: str) -> Dict:
+        stats = self.compute_statistics()
+        json_file = Path(json_path)
+        json_file.parent.mkdir(parents=True, exist_ok=True)
+        with json_file.open("w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False)
+        return stats
+
     def _sample_to_data(self, descriptor: Tuple[int, int, int, int, int]) -> Dict:
         episode_id, start, end, window_start, anchor_step = descriptor
         ep_len = end - start
@@ -309,4 +358,40 @@ class RobosuiteStateDataset(BaseImageDataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         data = self._sample_to_data(self._sample_index[idx])
-        return _recursive_to_torch(data)
+        data = _recursive_to_torch(data)
+
+        if self.norm_input_output:
+            if not hasattr(self, "_minmax_stats_cache"):
+                self._minmax_stats_cache = self.compute_statistics()["stats"]
+
+            eps = 1e-12
+            for key in ("all_state", "agent_state", "env_state"):
+                tensor = data["obs"][key]
+                min_v = torch.as_tensor(
+                    self._minmax_stats_cache[key]["min"],
+                    dtype=tensor.dtype,
+                    device=tensor.device
+                )
+                max_v = torch.as_tensor(
+                    self._minmax_stats_cache[key]["max"],
+                    dtype=tensor.dtype,
+                    device=tensor.device
+                )
+                data["obs"][key] = (tensor - min_v) / (max_v - min_v + eps)
+
+            action = data["action"]
+            action_min = torch.as_tensor(
+                self._minmax_stats_cache["action"]["min"],
+                dtype=action.dtype,
+                device=action.device
+            )
+            action_max = torch.as_tensor(
+                self._minmax_stats_cache["action"]["max"],
+                dtype=action.dtype,
+                device=action.device
+            )
+            data["action"] = (action - action_min) / (action_max - action_min + eps)
+        else:
+            pass
+
+        return data

@@ -33,7 +33,7 @@ CUDA_VISIBLE_DEVICES=5 uvicorn gpu_service_reverse:gpu_app --port 6071
 gpu_app = FastAPI()
 max_cache_action = 32  # NOTE: how many steps will be really executed by the policy before receiving new observation. This is determined by the training data collection process, e.g. if the data collection script saves one image every 8 steps, then max_cache_action should be set to 8.
 
-log_time = "2026.04.22-01.43.49"
+log_time = "2026.04.24-17.27.49"
 w_idx = -1
 
 map_time_to_dataset = {
@@ -48,10 +48,15 @@ map_time_to_dataset = {
     "2026.04.22-02.35.32": "0209_tower_boby_easy_reversed",
     "2026.04.22-01.34.29": "0417_test_tube_reversed",
     "2026.04.22-01.43.49": "0417_french_press_reversed",
+    "2026.04.22-18.17.12": "0417_test_tube_reversed",
+    "2026.04.22-18.13.59": "0417_french_press_reversed",
+    "2026.04.23-14.46.54": "0209_tower_boby_easy_reversed",
+    "2026.04.24-16.36.26": "0209_tower_boby_easy_reversed",
+    "2026.04.24-16.46.18": "0417_put_mouse_reversed",
+    "2026.04.24-17.27.49": "0417_french_press_reversed",
 }
-# map_time_to_dataset = {k.replace('-', '/'): v for k, v in map_time_to_dataset.items()}  # for ITX path compatibility
-train_project_dir = f"/mnt/dongxu-fs1/data-hdd/geyuan/code/dp23rss_fork/data/outputs/{log_time.replace('-', '/')}_train_diffusion_transformer_hybrid_pusht_images"
-# train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
+# train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_images"
+train_project_dir = f"/home/geyuan/code/dp23rss_fork/data/outputs/{log_time}_train_diffusion_transformer_hybrid_pusht_image"
 train_project_dir = train_project_dir.replace('-', '/')
 dataset_name = "pot_object"  # shovel; pot, pot_light; pepper
 dataset_name = map_time_to_dataset.get(log_time, dataset_name)
@@ -106,6 +111,7 @@ with open(train_project_statistics_file, 'r') as json_file:
     datasets_total_len = statistics["total_len"]
     dataset_action_min = np.array(dataset_stats["rel_actions"]["min"])
     dataset_action_max = np.array(dataset_stats["rel_actions"]["max"])
+    dataset_action_mean = np.array(dataset_stats["rel_actions"]["mean"])
     dataset_stats['force_torque']['p01'] = np.array(dataset_stats["force_torque"]['p01'])
     dataset_stats['force_torque']['p99'] = np.array(dataset_stats["force_torque"]['p99'])
 
@@ -230,7 +236,7 @@ def model_step(step_request: StepRequestFromEvaluator):
     # step_data = step_request.decode_to_raw()
     video_buffer = mem_buffer.get_or_allocate("gt_video")
     step_data = step_request.decode_to_raw_buffer(out_video_buffer=video_buffer)
-    instruction_text = step_data["instruction"]  # TODO: will contain a "success"/"fail" flag
+    instruction_text = step_data["instruction"]
     stage_flag = step_data["stage_flag"]
     gt_video = step_data["gt_video"]  # (B,V*Ts,H,W,3) uint8, Ts can be larger than v1
     tcp_state = step_data["tcp_state"]  # (B,Ts,D+6) float32 or None, NOTE: includes force data
@@ -327,6 +333,8 @@ def model_step(step_request: StepRequestFromEvaluator):
     action = action * (dataset_action_max - dataset_action_min) + dataset_action_min
 
     cache_action = action
+    threshold = dataset_action_mean[-1]
+    print("[DEBUG] threshold=", threshold)
     for act_idx in range(cache_action.shape[0]):
         if cache_action[act_idx, 6:] >= 0.5:
             cache_action[act_idx, 6:] = 1

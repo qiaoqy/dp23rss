@@ -19,9 +19,9 @@ from robokit.debug_utils.printer import print_batch
 conda activate robodiff
 cd code/dp23rss_fork
 export PYTHONPATH=~/code/dp23rss_fork
-export CKPT_INDEX=4
-export TRAIN_DIR=/home/geyuan/code/dp23rss_fork/data/outputs/2026.04.17/17.27.18_train_diffusion_transformer_hybrid_robosuite_state
-CUDA_VISIBLE_DEVICES=7 uvicorn gpu_service_robosuite:gpu_app --port 7287
+export CKPT_INDEX=-2
+export TRAIN_DIR=/home/geyuan/code/dp23rss_fork/data/outputs/2026.04.24/01.52.14_train_diffusion_transformer_hybrid_robosuite_state
+CUDA_VISIBLE_DEVICES=6 uvicorn gpu_service_robosuite:gpu_app --port 7286
 """
 
 gpu_app = FastAPI()
